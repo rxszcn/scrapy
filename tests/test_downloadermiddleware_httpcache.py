@@ -14,6 +14,7 @@ from unittest import mock
 
 import pytest
 from twisted.internet.defer import Deferred
+from twisted.internet.error import ConnectionLost
 
 from scrapy import signals
 from scrapy.core.downloader.middleware import DownloaderMiddlewareManager
@@ -1246,6 +1247,101 @@ class TestInFlightTracking(TestBase):
             # in-flight download, with a fresh list of waiters.
             assert not waiters
             assert mw._downloading.get(fingerprint) is not waiters
+
+
+class TestIncrementalRecheck(TestBase):
+    """Requests marked with the ``_incremental_recheck`` meta key are
+    resolved against the cache without reaching the spider."""
+
+    policy_class = "scrapy.extensions.httpcache.DummyPolicy"
+    storage_class = "scrapy.extensions.httpcache.FilesystemCacheStorage"
+
+    def _recheck_request(self, **kwargs: Any) -> Request:
+        kwargs.setdefault("url", self.request.url)
+        meta = kwargs.pop("meta", {})
+        meta["_incremental_recheck"] = True
+        return Request(meta=meta, **kwargs)
+
+    @coroutine_test
+    async def test_fresh_cache_drops_recheck(self):
+        with self._middleware() as mw:
+            assert mw.crawler.spider
+            mw.storage.store_response(mw.crawler.spider, self.request, self.response)
+            with pytest.raises(IgnoreRequest):
+                await mw.process_request(self._recheck_request())
+            assert mw.crawler.stats.get_value("httpcache/hit") == 1
+            assert mw.crawler.stats.get_value("incremental/unchanged") == 1
+
+    @coroutine_test
+    async def test_fresh_cache_returns_response_without_recheck(self):
+        with self._middleware() as mw:
+            assert mw.crawler.spider
+            mw.storage.store_response(mw.crawler.spider, self.request, self.response)
+            response = await mw.process_request(self.request)
+            assert isinstance(response, Response)
+            self.assertEqualResponse(self.response, response)
+            assert not mw.crawler.stats.get_value("incremental/unchanged")
+
+    @coroutine_test
+    async def test_cache_miss_downloads_recheck(self):
+        with self._middleware() as mw:
+            request = self._recheck_request()
+            assert await mw.process_request(request) is None
+            assert mw.crawler.stats.get_value("httpcache/miss") == 1
+
+    @coroutine_test
+    async def test_revalidated_cache_drops_recheck(self):
+        policy = f"{__name__}.AlwaysStalePolicy"
+        with self._middleware(HTTPCACHE_POLICY=policy) as mw:
+            assert mw.crawler.spider
+            mw.storage.store_response(mw.crawler.spider, self.request, self.response)
+            request = self._recheck_request()
+            assert await mw.process_request(request) is None
+            assert "cached_response" in request.meta
+            with pytest.raises(IgnoreRequest):
+                mw.process_response(request, Response(self.request.url, status=304))
+            assert mw.crawler.stats.get_value("httpcache/revalidate") == 1
+            assert mw.crawler.stats.get_value("incremental/unchanged") == 1
+
+    @coroutine_test
+    async def test_changed_response_is_returned(self):
+        policy = "scrapy.extensions.httpcache.RFC2616Policy"
+        with self._middleware(HTTPCACHE_POLICY=policy) as mw:
+            assert mw.crawler.spider
+            mw.storage.store_response(mw.crawler.spider, self.request, self.response)
+            request = self._recheck_request()
+            assert await mw.process_request(request) is None
+            response = Response(self.request.url, status=200, body=b"new body")
+            assert mw.process_response(request, response) is response
+            assert mw.crawler.stats.get_value("httpcache/invalidate") == 1
+            assert not mw.crawler.stats.get_value("incremental/unchanged")
+
+    @coroutine_test
+    async def test_download_error_drops_recheck(self):
+        policy = f"{__name__}.AlwaysStalePolicy"
+        with self._middleware(HTTPCACHE_POLICY=policy) as mw:
+            assert mw.crawler.spider
+            mw.storage.store_response(mw.crawler.spider, self.request, self.response)
+            request = self._recheck_request()
+            assert await mw.process_request(request) is None
+            with pytest.raises(IgnoreRequest):
+                mw.process_exception(request, ConnectionLost("boom"))
+            assert mw.crawler.stats.get_value("httpcache/errorrecovery") == 1
+            assert mw.crawler.stats.get_value("incremental/unchanged") == 1
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"meta": {"dont_cache": True}},
+            {"url": "file:///tmp/example.file"},
+        ],
+    )
+    @coroutine_test
+    async def test_uncacheable_recheck_is_dropped(self, kwargs):
+        with self._middleware() as mw:
+            with pytest.raises(IgnoreRequest):
+                await mw.process_request(self._recheck_request(**kwargs))
+            assert mw.crawler.stats.get_value("incremental/uncacheable") == 1
 
 
 class ScopeTestMixin(TestBase):

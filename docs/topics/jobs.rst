@@ -92,6 +92,78 @@ is omitted for brevity):
         # parse item here
         self.state["items_count"] = self.state.get("items_count", 0) + 1
 
+.. _incremental-recrawls:
+
+Incremental recrawls
+====================
+
+A regular resumed job only sends requests that were still pending when the
+job stopped: requests that finished are never sent again, so already-crawled
+pages are never updated. Setting :setting:`INCREMENTAL_CRAWL_ENABLED` to
+``True`` changes that, so that a job can be recrawled periodically to refresh
+its data.
+
+Incremental recrawling requires :setting:`JOBDIR` and
+:setting:`HTTPCACHE_ENABLED`. It works as follows:
+
+-   Requests that finished downloading in a previous run are scheduled
+    again, but instead of being downloaded and parsed blindly, they are
+    checked against the :ref:`HTTP cache <httpcache-middleware>`:
+
+    -   If the cached response is still fresh, the request is dropped
+        without downloading or parsing anything.
+
+    -   If the cached response is stale, a conditional request is sent when
+        the cached response allows it, e.g. with the
+        :class:`~scrapy.extensions.httpcache.RFC2616Policy` cache policy. If
+        the server answers that the response has not changed (304), the
+        cached response is kept and, again, nothing is parsed. Only if the
+        response has changed is the new response parsed.
+
+    -   If there is no cached response, the request is downloaded and parsed
+        as usual.
+
+-   Requests that were being downloaded when the previous run stopped, and
+    requests whose download failed, are scheduled again on the next run, so
+    no page is lost even after an unclean shutdown.
+
+Because unchanged pages are not parsed again, their items are not yielded
+again either, so recrawling a job does not duplicate items.
+
+Keep the following in mind:
+
+-   Whether a cached response is fresh depends on the cache policy and
+    :setting:`HTTPCACHE_EXPIRATION_SECS`. The default policy,
+    :class:`~scrapy.extensions.httpcache.DummyPolicy`, considers every
+    cached response fresh, so pages are only re-downloaded after their cache
+    entries expire, and expiring entries cannot be revalidated, hence pages
+    whose entries expire are downloaded and parsed again. Keep
+    :setting:`HTTPCACHE_EXPIRATION_SECS` at ``0`` (no expiration) to avoid
+    that.
+
+-   Requests that cannot be cached, e.g. with the :reqmeta:`dont_cache`
+    meta key, are dropped without downloading on recrawls, since there is no
+    cached response to check them against.
+
+-   Requests with :attr:`~scrapy.http.Request.dont_filter` enabled, such as
+    :ref:`start requests <start-requests>`, skip the duplicate filter but
+    are still checked against the cache like any other request.
+
+The following :ref:`stats <topics-stats>` reflect incremental recrawling:
+
+-   ``incremental/recheck``: requests scheduled to re-check their cached
+    response.
+
+-   ``incremental/recovered``: requests scheduled again on startup because
+    their download did not finish in the previous run.
+
+-   ``incremental/unchanged``: rechecked requests resolved from the cache
+    without parsing.
+
+-   ``incremental/uncacheable``: rechecked requests dropped because they
+    cannot be cached.
+
+
 Persistence gotchas
 ===================
 

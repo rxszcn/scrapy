@@ -383,6 +383,8 @@ or :setting:`HTTPAUTH_PASS` is set.
 .. _Basic access authentication: https://en.wikipedia.org/wiki/Basic_access_authentication
 
 
+.. _httpcache-middleware:
+
 HttpCacheMiddleware
 -------------------
 

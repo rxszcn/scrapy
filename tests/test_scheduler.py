@@ -14,11 +14,13 @@ from scrapy.core.scheduler import Scheduler
 from scrapy.crawler import Crawler
 from scrapy.dupefilters import BaseDupeFilter
 from scrapy.exceptions import ScrapyDeprecationWarning
-from scrapy.http import Request
+from scrapy.http import Request, Response
 from scrapy.pqueues import ScrapyPriorityQueue
+from scrapy.signals import response_received
 from scrapy.spiders import Spider
 from scrapy.utils.defer import ensure_awaitable
 from scrapy.utils.misc import build_from_crawler, load_object
+from scrapy.utils.request import RequestFingerprinter
 from scrapy.utils.test import get_crawler
 from tests.mockserver.http import MockServer
 from tests.utils.decorators import coroutine_test, inline_callbacks_test
@@ -481,3 +483,247 @@ async def test_unserializable_requests(
     assert crawler.stats.get_value("scheduler/unserializable") == 2
     assert crawler.stats.get_value("scheduler/enqueued/memory") == 2
     assert caplog.text.count("Unable to serialize request") == 1
+
+
+class TestIncrementalScheduler:
+    """Tests for INCREMENTAL_CRAWL_ENABLED."""
+
+    @asynccontextmanager
+    async def create_scheduler(
+        self, jobdir: Path | None, **settings: Any
+    ) -> AsyncGenerator[Scheduler]:
+        settings = {
+            "DUPEFILTER_CLASS": "scrapy.dupefilters.RFPDupeFilter",
+            "HTTPCACHE_ENABLED": True,
+            "INCREMENTAL_CRAWL_ENABLED": True,
+            **settings,
+        }
+        mock_crawler = MockCrawler(
+            "scrapy.pqueues.ScrapyPriorityQueue",
+            jobdir,
+            **settings,
+        )
+        # Set by Crawler._apply_settings() in a real crawl.
+        mock_crawler.request_fingerprinter = RequestFingerprinter()
+        scheduler = build_from_crawler(Scheduler, mock_crawler)
+        spider = Spider.from_crawler(mock_crawler, name="spider")
+        await ensure_awaitable(scheduler.open(spider))
+        try:
+            yield scheduler
+        finally:
+            await ensure_awaitable(scheduler.close("finished"))
+            await mock_crawler.stop_async()
+            mock_crawler.engine.downloader.close()
+
+    @staticmethod
+    def _download(scheduler: Scheduler, request: Request) -> None:
+        """Simulate a successful download of a dequeued request."""
+        assert scheduler.crawler is not None
+        scheduler.crawler.signals.send_catch_log(
+            response_received,
+            response=Response(request.url, request=request),
+            request=request,
+            spider=scheduler.spider,
+        )
+
+    @coroutine_test
+    async def test_inflight_requests_are_recovered(self, tmp_path: Path) -> None:
+        """Requests dequeued when the job stops are scheduled again on the
+        next run, no matter how many were in-flight (i.e. the concurrency
+        of the previous run), and no URL is scheduled twice."""
+        urls = sorted(f"https://example.com/{i}" for i in range(5))
+        async with self.create_scheduler(tmp_path) as scheduler:
+            for url in urls:
+                scheduler.enqueue_request(Request(url))
+            assert scheduler.next_request() is not None
+            assert scheduler.next_request() is not None
+        async with self.create_scheduler(tmp_path) as scheduler:
+            assert scheduler.stats is not None
+            assert scheduler.stats.get_value("incremental/recovered") == 2
+            # The spider yielding the same URLs again changes nothing: the
+            # in-flight ones are already scheduled, the rest are still in
+            # the persisted queue.
+            for url in urls:
+                assert not scheduler.enqueue_request(Request(url))
+            assert sorted(_dequeue_urls(scheduler)) == urls
+
+    @coroutine_test
+    async def test_completed_requests_are_not_recovered(self, tmp_path: Path) -> None:
+        """Requests whose response reached the engine are not scheduled
+        again on the next run."""
+        async with self.create_scheduler(tmp_path) as scheduler:
+            scheduler.enqueue_request(Request("https://example.com/a"))
+            request = scheduler.next_request()
+            assert request is not None
+            self._download(scheduler, request)
+        async with self.create_scheduler(tmp_path) as scheduler:
+            assert not scheduler.has_pending_requests()
+
+    @coroutine_test
+    async def test_done_requests_are_rechecked(self, tmp_path: Path) -> None:
+        """A request that finished in a previous run is scheduled again for
+        a cache recheck instead of being filtered out, but only once per
+        run."""
+        async with self.create_scheduler(tmp_path) as scheduler:
+            scheduler.enqueue_request(Request("https://example.com/a"))
+            request = scheduler.next_request()
+            assert request is not None
+            self._download(scheduler, request)
+        async with self.create_scheduler(tmp_path) as scheduler:
+            request = Request("https://example.com/a")
+            assert scheduler.enqueue_request(request)
+            assert request.meta["_incremental_recheck"] is True
+            assert scheduler.stats is not None
+            assert scheduler.stats.get_value("incremental/recheck") == 1
+            # A second yield of the same URL in the same run is filtered.
+            assert not scheduler.enqueue_request(Request("https://example.com/a"))
+            assert _dequeue_urls(scheduler) == ["https://example.com/a"]
+
+    @coroutine_test
+    async def test_seen_but_unfinished_requests_are_filtered(
+        self, tmp_path: Path
+    ) -> None:
+        """A request that was scheduled but never finished is filtered out
+        when yielded again; the persisted queue and the in-flight journal
+        already track it."""
+        async with self.create_scheduler(tmp_path) as scheduler:
+            scheduler.enqueue_request(Request("https://example.com/a"))
+            scheduler.enqueue_request(Request("https://example.com/b"))
+            assert scheduler.next_request() is not None  # b, in-flight
+        async with self.create_scheduler(tmp_path) as scheduler:
+            assert not scheduler.enqueue_request(Request("https://example.com/a"))
+            assert not scheduler.enqueue_request(Request("https://example.com/b"))
+            assert sorted(_dequeue_urls(scheduler)) == [
+                "https://example.com/a",
+                "https://example.com/b",
+            ]
+
+    @coroutine_test
+    async def test_failed_retry_keeps_done_state(self, tmp_path: Path) -> None:
+        """A failed retry of a recheck does not dirty the done state of a
+        fingerprint: the next run still treats it as done and does not
+        recover it as a lost request."""
+        url = "https://example.com/a"
+        async with self.create_scheduler(tmp_path) as scheduler:
+            scheduler.enqueue_request(Request(url))
+            request = scheduler.next_request()
+            assert request is not None
+            self._download(scheduler, request)
+        async with self.create_scheduler(tmp_path) as scheduler:
+            assert scheduler.enqueue_request(Request(url))
+            request = scheduler.next_request()
+            assert request is not None
+            assert request.meta["_incremental_recheck"] is True
+            # The recheck fails and is retried once, without success (no
+            # response_received signal is sent).
+            retry = Request(url, meta={"skip_dupefilter_once": True})
+            assert scheduler.enqueue_request(retry)
+            assert "_incremental_recheck" not in retry.meta
+            assert scheduler.next_request() is not None
+        async with self.create_scheduler(tmp_path) as scheduler:
+            assert scheduler.stats is not None
+            assert not scheduler.stats.get_value("incremental/recovered")
+            request = Request(url)
+            assert scheduler.enqueue_request(request)
+            assert request.meta["_incremental_recheck"] is True
+
+    @coroutine_test
+    async def test_unserializable_inflight_requests_are_not_recovered(
+        self, tmp_path: Path
+    ) -> None:
+        """Requests that cannot be serialized cannot be recovered."""
+        async with self.create_scheduler(tmp_path) as scheduler:
+            request = Request(
+                "https://example.com/a", meta={"unserializable": lambda: None}
+            )
+            scheduler.enqueue_request(request)
+            assert scheduler.next_request() is not None
+        async with self.create_scheduler(tmp_path) as scheduler:
+            assert not scheduler.has_pending_requests()
+
+    @coroutine_test
+    async def test_dont_filter_requests_are_rechecked(self, tmp_path: Path) -> None:
+        """Requests with dont_filter (e.g. start requests) skip the
+        duplicate filter, but if they were downloaded in a previous run they
+        are still scheduled for a cache recheck."""
+        url = "https://example.com/a"
+        async with self.create_scheduler(tmp_path) as scheduler:
+            assert scheduler.enqueue_request(Request(url, dont_filter=True))
+            request = scheduler.next_request()
+            assert request is not None
+            self._download(scheduler, request)
+        async with self.create_scheduler(tmp_path) as scheduler:
+            request = Request(url, dont_filter=True)
+            assert scheduler.enqueue_request(request)
+            assert request.meta["_incremental_recheck"] is True
+            # A regular request to a URL only ever downloaded through a
+            # dont_filter request is also rechecked instead of downloaded
+            # and parsed blindly.
+            request = Request(url)
+            assert scheduler.enqueue_request(request)
+            assert request.meta["_incremental_recheck"] is True
+
+    @coroutine_test
+    async def test_no_jobdir_disables_incremental(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level("WARNING"):
+            async with self.create_scheduler(None) as scheduler:
+                scheduler.enqueue_request(Request("https://example.com/a"))
+                assert scheduler.next_request() is not None
+        assert "JOBDIR" in caplog.text
+
+    @coroutine_test
+    async def test_no_httpcache_disables_recheck(self, tmp_path: Path) -> None:
+        """Without HTTPCACHE_ENABLED, done requests are filtered out as
+        usual instead of being scheduled for a recheck."""
+        settings = {"HTTPCACHE_ENABLED": False}
+        async with self.create_scheduler(tmp_path, **settings) as scheduler:
+            scheduler.enqueue_request(Request("https://example.com/a"))
+            request = scheduler.next_request()
+            assert request is not None
+            self._download(scheduler, request)
+        async with self.create_scheduler(tmp_path, **settings) as scheduler:
+            assert not scheduler.enqueue_request(Request("https://example.com/a"))
+
+
+class _IncrementalSpider(Spider):
+    name = "incremental"
+
+    def __init__(self, urls, parsed, **kwargs):
+        super().__init__(**kwargs)
+        self.start_urls = urls
+        self.parsed = parsed
+
+    def parse(self, response):
+        self.parsed.append(response.url)
+
+
+@coroutine_test
+async def test_incremental_recrawl(tmp_path: Path) -> None:
+    """A second run of a finished job re-checks every page against the HTTP
+    cache: fresh cached responses are neither downloaded nor parsed again."""
+    settings = {
+        "JOBDIR": str(tmp_path / "job"),
+        "HTTPCACHE_ENABLED": True,
+        "HTTPCACHE_DIR": str(tmp_path / "cache"),
+        "INCREMENTAL_CRAWL_ENABLED": True,
+    }
+    with MockServer() as mockserver:
+        urls = [
+            mockserver.url("/status?n=200", is_secure=False),
+            mockserver.url("/echo?body=test", is_secure=False),
+        ]
+        parsed: list[str] = []
+        crawler = get_crawler(_IncrementalSpider, settings)
+        await crawler.crawl_async(urls=urls, parsed=parsed)
+        assert sorted(parsed) == sorted(urls)
+        assert crawler.stats.get_value("downloader/response_count") == 2
+
+        parsed = []
+        crawler = get_crawler(_IncrementalSpider, settings)
+        await crawler.crawl_async(urls=urls, parsed=parsed)
+        assert parsed == []
+        assert not crawler.stats.get_value("downloader/response_count")
+        assert crawler.stats.get_value("incremental/recheck") == 2
+        assert crawler.stats.get_value("incremental/unchanged") == 2

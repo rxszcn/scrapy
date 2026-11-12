@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import json
 import logging
+import pickle
+import sqlite3
 from abc import abstractmethod
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ParamSpec, Self, cast
 
 from twisted.internet.defer import Deferred
 
+from scrapy import signals
 from scrapy.spiders import Spider  # noqa: TC001
 from scrapy.utils.conf import _job_dir
 from scrapy.utils.defer import ensure_awaitable
 from scrapy.utils.misc import build_from_crawler, load_object
 from scrapy.utils.python import global_object_name
+from scrapy.utils.request import request_from_dict
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
@@ -22,6 +26,7 @@ if TYPE_CHECKING:
     from scrapy.crawler import Crawler
     from scrapy.dupefilters import BaseDupeFilter
     from scrapy.http.request import Request
+    from scrapy.http.response import Response
     from scrapy.pqueues import PriorityQueueProtocol
     from scrapy.statscollectors import StatsCollector
 
@@ -54,6 +59,67 @@ def _call_dupefilter(
         await awaitable
 
     return wait()
+
+
+class _IncrementalState:
+    """SQLite-backed tracking of completed and in-flight requests.
+
+    Used when :setting:`INCREMENTAL_CRAWL_ENABLED` is set. The ``done`` table
+    holds the fingerprints of requests whose response reached the engine. The
+    ``inflight`` table holds serialized requests that were dequeued but whose
+    response never reached the engine, so that a later run can schedule them
+    again instead of losing them.
+    """
+
+    def __init__(self, path: str) -> None:
+        self._db = sqlite3.connect(Path(path, "state.db"))
+        self._db.execute("PRAGMA journal_mode=WAL").close()
+        self._db.execute("PRAGMA synchronous=NORMAL")
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS done (fingerprint BLOB PRIMARY KEY)"
+            " WITHOUT ROWID"
+        )
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS inflight"
+            " (fingerprint BLOB PRIMARY KEY, request BLOB NOT NULL)"
+            " WITHOUT ROWID"
+        )
+
+    def is_done(self, fingerprint: bytes) -> bool:
+        cursor = self._db.execute(
+            "SELECT 1 FROM done WHERE fingerprint = ?", (fingerprint,)
+        )
+        return cursor.fetchone() is not None
+
+    def complete(self, fingerprint: bytes) -> None:
+        """Mark a fingerprint as done and forget any in-flight record of it,
+        atomically, so that both tables never hold the same fingerprint."""
+        with self._db:
+            self._db.execute("INSERT OR IGNORE INTO done VALUES (?)", (fingerprint,))
+            self._db.execute(
+                "DELETE FROM inflight WHERE fingerprint = ?", (fingerprint,)
+            )
+
+    def add_inflight(self, fingerprint: bytes, request: bytes) -> None:
+        with self._db:
+            self._db.execute(
+                "INSERT OR REPLACE INTO inflight VALUES (?, ?)",
+                (fingerprint, request),
+            )
+
+    def pop_inflight(self) -> list[tuple[bytes, bytes]]:
+        """Return all in-flight (fingerprint, serialized request) pairs and
+        forget them."""
+        with self._db:
+            rows = self._db.execute(
+                "SELECT fingerprint, request FROM inflight"
+            ).fetchall()
+            self._db.execute("DELETE FROM inflight")
+        return rows
+
+    def close(self) -> None:
+        self._db.commit()
+        self._db.close()
 
 
 class BaseSchedulerMeta(type):
@@ -197,6 +263,12 @@ class Scheduler(BaseScheduler):
     Duplicate requests are filtered out with an instance of
     :setting:`DUPEFILTER_CLASS`.
 
+    When :setting:`INCREMENTAL_CRAWL_ENABLED` is set, requests whose
+    download finished in a previous run are scheduled again instead of being
+    filtered out, so that the :ref:`HTTP cache <httpcache-middleware>` can
+    decide whether they need to be downloaded and parsed again. See
+    :ref:`incremental-recrawls`.
+
     .. _request-order:
 
     Request order
@@ -299,6 +371,10 @@ class Scheduler(BaseScheduler):
         directory, directly or though instances of
         :setting:`SCHEDULER_DISK_QUEUE`.
 
+    -   When :setting:`INCREMENTAL_CRAWL_ENABLED` is set, tracks completed
+        and in-flight requests in an SQLite database named ``state.db``
+        inside the ``requests.queue`` directory.
+
     This scheduler class also uses the configured :setting:`DUPEFILTER_CLASS`,
     which may also write data inside the job directory.
     """
@@ -383,6 +459,15 @@ class Scheduler(BaseScheduler):
         self._smqclass: type[BaseQueue] | None = self._get_start_queue_cls(
             crawler, "MEMORY"
         )
+        self._incremental: bool = bool(
+            crawler and crawler.settings.getbool("INCREMENTAL_CRAWL_ENABLED")
+        )
+        self._incremental_state: _IncrementalState | None = None
+        self._recheck_enabled: bool = False
+        # Fingerprints already scheduled for a recheck in this run, so that
+        # the same URL is not scheduled twice within the run no matter how
+        # many times it is yielded.
+        self._rechecked: set[bytes] = set()
 
     def _get_start_queue_cls(
         self, crawler: Crawler | None, queue: str
@@ -408,13 +493,78 @@ class Scheduler(BaseScheduler):
         self.dqs: PriorityQueueProtocol | None = self._dq() if self.dqdir else None
         self._dqs_changes = 0
         self._sync_dqs_state()
+        if self._incremental:
+            self._open_incremental()
         return _call_dupefilter(self.df.open)
+
+    def _open_incremental(self) -> None:
+        assert self.crawler is not None
+        if self.dqdir is None:
+            logger.warning(
+                "INCREMENTAL_CRAWL_ENABLED is set but JOBDIR is not, "
+                "incremental recrawling is disabled."
+            )
+            self._incremental = False
+            return
+        self._recheck_enabled = self.crawler.settings.getbool("HTTPCACHE_ENABLED")
+        if not self._recheck_enabled:
+            logger.warning(
+                "INCREMENTAL_CRAWL_ENABLED is set but HTTPCACHE_ENABLED is "
+                "not, already-crawled pages will not be re-checked against "
+                "the HTTP cache."
+            )
+        self._incremental_state = _IncrementalState(self.dqdir)
+        self._recover_inflight()
+        self.crawler.signals.connect(
+            self._response_received, signal=signals.response_received
+        )
+
+    def _recover_inflight(self) -> None:
+        """Schedule again the requests that were dequeued when the previous
+        run stopped but never got a response."""
+        assert self._incremental_state is not None
+        state = self._incremental_state
+        recovered = 0
+        for fingerprint, data in state.pop_inflight():
+            if state.is_done(fingerprint):
+                # Completed in an earlier run; the next recheck handles it.
+                continue
+            request = request_from_dict(pickle.loads(data), spider=self.spider)  # noqa: S301
+            if not self._dqpush(request):  # pragma: no cover
+                # Only reachable if the request became unserializable since
+                # it was journaled.
+                self._mqpush(request)
+            recovered += 1
+        if recovered:
+            assert self.stats is not None
+            self.stats.inc_value("incremental/recovered", recovered)
+            logger.info(
+                f"Recovered {recovered} in-flight requests from the previous run",
+                extra={"spider": self.spider},
+            )
+
+    def _response_received(
+        self, response: Response, request: Request, spider: Spider
+    ) -> None:
+        """Mark the request fingerprint as done and clear its in-flight
+        record."""
+        assert self.crawler is not None
+        assert self._incremental_state is not None
+        fingerprint = self.crawler.request_fingerprinter.fingerprint(request)
+        self._incremental_state.complete(fingerprint)
 
     def close(self, reason: str) -> Coroutine[Any, Any, None] | None:
         """
         (1) dump pending requests to disk if there is a disk queue
         (2) return the result of the dupefilter's ``close`` method
         """
+        if self._incremental_state is not None:
+            assert self.crawler is not None
+            self.crawler.signals.disconnect(
+                self._response_received, signal=signals.response_received
+            )
+            self._incremental_state.close()
+            self._incremental_state = None
         if self.dqs is not None:
             state = self.dqs.close()
             assert isinstance(self.dqdir, str)
@@ -432,13 +582,19 @@ class Scheduler(BaseScheduler):
         Return ``True`` if the request was stored successfully, ``False`` otherwise.
         """
         skip_dupefilter = request.meta.pop("skip_dupefilter_once", False)
-        if (
-            not request.dont_filter
-            and not skip_dupefilter
-            and self.df.request_seen(request)
-        ):
-            self.df.log(request, self.spider)
-            return False
+        if not skip_dupefilter:
+            if request.dont_filter:
+                # Requests that skip the duplicate filter may still have
+                # been downloaded in a previous run.
+                self._recheck(request, once=False)
+            elif self.df.request_seen(request):
+                if not self._recheck(request):
+                    self.df.log(request, self.spider)
+                    return False
+            else:
+                # New to the duplicate filter, but possibly downloaded in a
+                # previous run through a dont_filter request.
+                self._recheck(request)
         dqok = self._dqpush(request)
         assert self.stats is not None
         if dqok:
@@ -447,6 +603,28 @@ class Scheduler(BaseScheduler):
             self._mqpush(request)
             self.stats.inc_value("scheduler/enqueued/memory")
         self.stats.inc_value("scheduler/enqueued")
+        return True
+
+    def _recheck(self, request: Request, *, once: bool = True) -> bool:
+        """Return whether the request must be scheduled to re-check its
+        cached response instead of being downloaded and parsed blindly,
+        marking it accordingly.
+
+        *once* limits a fingerprint to a single recheck per run.
+        """
+        if self._incremental_state is None or not self._recheck_enabled:
+            return False
+        assert self.crawler is not None
+        fingerprint = self.crawler.request_fingerprinter.fingerprint(request)
+        if once and fingerprint in self._rechecked:
+            return False
+        if not self._incremental_state.is_done(fingerprint):
+            return False
+        if once:
+            self._rechecked.add(fingerprint)
+        request.meta["_incremental_recheck"] = True
+        assert self.stats is not None
+        self.stats.inc_value("incremental/recheck")
         return True
 
     def next_request(self) -> Request | None:
@@ -471,7 +649,22 @@ class Scheduler(BaseScheduler):
                 self.stats.inc_value("scheduler/dequeued/disk")
         if request is not None:
             self.stats.inc_value("scheduler/dequeued")
+            self._track_inflight(request)
         return request
+
+    def _track_inflight(self, request: Request) -> None:
+        """Record a dequeued request as in-flight, so that a later run can
+        schedule it again if its response never arrives."""
+        if self._incremental_state is None:
+            return
+        assert self.crawler is not None
+        try:
+            data = pickle.dumps(request.to_dict(spider=self.spider), protocol=4)
+        except (pickle.PicklingError, AttributeError, TypeError, ValueError):
+            # Unserializable requests cannot be recovered.
+            return
+        fingerprint = self.crawler.request_fingerprinter.fingerprint(request)
+        self._incremental_state.add_inflight(fingerprint, data)
 
     def __len__(self) -> int:
         """

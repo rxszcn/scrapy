@@ -77,13 +77,24 @@ class HttpCacheMiddleware:
     async def process_request(
         self, request: Request, spider: Spider | None = None
     ) -> Request | Response | None:
+        recheck = request.meta.get("_incremental_recheck", False)
         if request.meta.get("dont_cache", False):
+            if recheck:
+                self.stats.inc_value("incremental/uncacheable")
+                raise IgnoreRequest(
+                    f"Cannot re-check an uncacheable request: {request}"
+                )
             return None
 
         # Skip uncacheable requests
         if request.meta.get("body_file") or not self.policy.should_cache_request(
             request
         ):
+            if recheck:
+                self.stats.inc_value("incremental/uncacheable")
+                raise IgnoreRequest(
+                    f"Cannot re-check an uncacheable request: {request}"
+                )
             request.meta["_dont_cache"] = True  # flag as uncacheable
             return None
 
@@ -104,6 +115,11 @@ class HttpCacheMiddleware:
         cachedresponse.flags.append("cached")
         if self.policy.is_cached_response_fresh(cachedresponse, request):
             self.stats.inc_value("httpcache/hit")
+            if recheck:
+                # The page has not changed since it was parsed, parsing the
+                # cached response again would yield duplicate items.
+                self.stats.inc_value("incremental/unchanged")
+                raise IgnoreRequest(f"Cached response is still fresh: {request}")
             return cachedresponse
 
         # Keep a reference to cached response to avoid a second cache lookup on
@@ -211,6 +227,9 @@ class HttpCacheMiddleware:
             if response.status == 304:
                 self._freshen_cached_response(cachedresponse, response)
                 self._cache_response(cachedresponse, request)
+            if request.meta.get("_incremental_recheck"):
+                self.stats.inc_value("incremental/unchanged")
+                raise IgnoreRequest(f"Cached response was revalidated: {request}")
             return cachedresponse
 
         self.stats.inc_value("httpcache/invalidate")
@@ -228,6 +247,13 @@ class HttpCacheMiddleware:
             exception, self.DOWNLOAD_EXCEPTIONS
         ):
             self.stats.inc_value("httpcache/errorrecovery")
+            if request.meta.get("_incremental_recheck"):
+                # The revalidation failed, but the cached response is still
+                # usable; the next run will re-check it again.
+                self.stats.inc_value("incremental/unchanged")
+                raise IgnoreRequest(
+                    f"Revalidation failed, keeping the cached response: {request}"
+                )
             return cachedresponse
         return None
 

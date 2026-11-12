@@ -1703,6 +1703,21 @@ through it. It must implement :class:`~scrapy.pipelines.ItemProcessorProtocol`.
     :members:
 
 
+.. setting:: INCREMENTAL_CRAWL_ENABLED
+
+INCREMENTAL_CRAWL_ENABLED
+-------------------------
+
+.. versionadded:: VERSION
+
+Default: ``False``
+
+Enables :ref:`incremental recrawls <incremental-recrawls>` of a
+:setting:`JOBDIR` job, using the :ref:`HTTP cache <httpcache-middleware>` to
+avoid downloading and parsing again pages that have not changed since the
+previous run.
+
+
 .. setting:: JOBDIR
 
 JOBDIR

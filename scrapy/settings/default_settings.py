@@ -480,6 +480,8 @@ IMAGES_STORE = None
 IMAGES_STORE_GCS_ACL = ""
 IMAGES_STORE_S3_ACL = "private"
 
+INCREMENTAL_CRAWL_ENABLED = False
+
 ITEM_PIPELINES: dict[str, int] = {}
 ITEM_PIPELINES_BASE: dict[str, int] = {}
 
